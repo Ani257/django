@@ -11,13 +11,14 @@ from razorpay_router import router as razorpay_router
 load_dotenv()
 
 # ── Allowed origins ───────────────────────────────────────────────────────────
-# Set FRONTEND_URL in .env for production, e.g. https://eccowatt.vercel.app
+# Set FRONTEND_URL in your Render/Vercel dashboard environment variables
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
 ALLOWED_ORIGINS = [
     FRONTEND_URL,
     "http://localhost:3000",   # Next.js dev server
     "http://127.0.0.1:3000",
+    "https://*.vercel.app",    # Allows all Vercel subdomains (Crucial for production)
 ]
 
 
