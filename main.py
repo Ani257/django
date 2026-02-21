@@ -1,42 +1,35 @@
 import os
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from supabase import create_client, Client
-import uvicorn
-from dotenv import load_dotenv
+from contextlib import asynccontextmanager
 from typing import Dict, List
-from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
-    allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
-)
-
-# Initialize Supabase client
 from dotenv import load_dotenv
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+from supabase import create_client, Client
 
-# Ensure environment variables are loaded from the .env file in the current working directory
+from database import create_db_and_tables
+from razorpay_router import router as razorpay_router
+
+# Load environment variables
 load_dotenv(".env")
+load_dotenv()
 
+# Supabase setup
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://your-project.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "your-anon-key")
 
 try:
     if SUPABASE_URL == "https://your-project.supabase.co":
         print("Warning: Using placeholder SUPABASE_URL")
-        
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 except Exception as e:
     print(f"Error initializing Supabase client: {e}")
     supabase = None
-    
+
+# Connection Manager for WebSockets
 class ConnectionManager:
     def __init__(self):
-        # Store active connections per product: {product_id: [websocket1, websocket2, ...]}
         self.active_connections: Dict[str, List[WebSocket]] = {}
 
     async def connect(self, websocket: WebSocket, product_id: str):
@@ -62,16 +55,44 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# Allowed origins
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+ALLOWED_ORIGINS = [
+    FRONTEND_URL,
+    "http://localhost:3000",   # Next.js dev server
+    "http://127.0.0.1:3000",
+    "https://*.vercel.app",    # Allows all Vercel subdomains
+    "*",                       # Temporarily allow all for local testing
+]
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create DB tables on startup."""
+    create_db_and_tables()
+    yield
+
+app = FastAPI(title="Reverse Auction API", version="1.0.0", lifespan=lifespan)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(razorpay_router)
+
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to the Reverse Auction API"}
+    return {"status": "ok", "message": "Welcome to the Reverse Auction API"}
 
 @app.get("/products")
 def get_products():
     if not supabase:
         return {"error": "Supabase client not initialized properly."}
     
-    # Example of querying the Products table
     response = supabase.table("products").select("*").execute()
     return {"data": response.data}
     
@@ -97,7 +118,6 @@ async def websocket_auction_endpoint(websocket: WebSocket, product_id: str):
                 drop_time_str = product.get("drop_time")
                 if drop_time_str:
                     from datetime import datetime, timezone
-                    # Handle Supabase Z notation for UTC
                     drop_time_parsed = datetime.fromisoformat(drop_time_str.replace("Z", "+00:00"))
                     if datetime.now(timezone.utc) < drop_time_parsed:
                         await websocket.send_json({"error": "Drop has not started yet"})
@@ -105,7 +125,7 @@ async def websocket_auction_endpoint(websocket: WebSocket, product_id: str):
                 
                 # 2. Deduct price if it hasn't reached minimum
                 if current_price > minimum_price:
-                    new_price = max(current_price - 1.0, minimum_price) # Ensure we don't drop below minimum
+                    new_price = max(current_price - 1.0, minimum_price)
                     
                     # 3. Update the new price in database
                     update_response = supabase.table("products").update({"current_price": new_price}).eq("id", product_id).execute()
