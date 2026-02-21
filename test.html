@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reverse Auction WebSocket Test</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            text-align: center;
+            margin-top: 50px;
+        }
+
+        #price {
+            font-size: 3em;
+            font-weight: bold;
+            color: green;
+            margin: 20px;
+        }
+
+        button {
+            padding: 15px 30px;
+            font-size: 1.2em;
+            cursor: pointer;
+        }
+
+        #messages {
+            margin-top: 30px;
+            color: gray;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>Reverse Auction Test</h1>
+
+    <div>Current Price:</div>
+    <div id="price">Waiting for price...</div>
+
+    <button id="shareButton">Simulate Share Click!</button>
+
+    <div id="messages"></div>
+
+    <script>
+        // Replace with the valid Product ID fetched from Supabase
+        const productId = "6ca22814-c1a4-42e2-bec5-fdb388806692";
+        const ws = new WebSocket(`ws://localhost:8000/ws/auction/${productId}`);
+
+        const priceDiv = document.getElementById("price");
+        const msgDiv = document.getElementById("messages");
+        const btn = document.getElementById("shareButton");
+
+        // Fetch initial price
+        fetch('http://localhost:8000/products')
+            .then(res => res.json())
+            .then(data => {
+                if (data.data) {
+                    const product = data.data.find(p => p.id === productId);
+                    if (product) {
+                        priceDiv.innerText = `₹${product.current_price.toFixed(2)}`;
+                    } else {
+                        priceDiv.innerText = "Product not found";
+                    }
+                }
+            })
+            .catch(err => console.error("Error fetching initial price:", err));
+
+        ws.onopen = () => {
+            msgDiv.innerText = "Connected to WebSocket.";
+        };
+
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            console.log("Message received:", data);
+
+            if (data.type === "price_update") {
+                priceDiv.innerText = `₹${data.new_price.toFixed(2)}`;
+            } else if (data.message) {
+                msgDiv.innerText = data.message;
+            } else if (data.error) {
+                msgDiv.innerText = "Error: " + data.error;
+            }
+        };
+
+        ws.onerror = (error) => {
+            msgDiv.innerText = "WebSocket Error. See console.";
+            console.error("WebSocket Error:", error);
+        };
+
+        ws.onclose = () => {
+            msgDiv.innerText = "WebSocket Connection Closed.";
+        };
+
+        btn.onclick = () => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ action: "share_click" }));
+                msgDiv.innerText = "Share Click sent!";
+            } else {
+                msgDiv.innerText = "WebSocket is not open.";
+            }
+        };
+    </script>
+</body>
+
+</html>
