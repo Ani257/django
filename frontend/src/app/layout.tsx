@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import Image from "next/image";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -23,11 +24,24 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="en" className="dark">
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
-        {children}
+        <div className="fixed inset-0 w-full h-full z-[-10] overflow-hidden pointer-events-none bg-black">
+          <Image
+            src="/sunset-glow.jpg"
+            alt="Site Background"
+            fill
+            className="object-cover opacity-50"
+            priority
+          />
+          {/* Subtle dark overlay to ensure text remains readable */}
+          <div className="absolute inset-0 bg-black/40"></div>
+        </div>
+        <div className="relative z-0">
+          {children}
+        </div>
       </body>
     </html>
   );

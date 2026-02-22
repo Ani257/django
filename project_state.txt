@@ -1,13 +1,27 @@
-Project Tree:
-=============
-reverse_auction_app/
+================================================================================
+DIRECTORY TREE
+================================================================================
+
+./
     .env
+    .gitignore
+    AuctionPage.jsx
+    CheckoutButton.jsx
+    clean_tree.txt
+    database.py
+    eccowatt.db
     generate_state.py
     main.py
+    models.py
+    PayNowButton.jsx
     project_state.txt
+    razorpay_router.py
     requirements.txt
+    reset_db.py
     schema.sql
+    SuccessPage.jsx
     test.html
+    tree.txt
     frontend/
         .env.local
         .gitignore
@@ -50,65 +64,77 @@ reverse_auction_app/
             utils/
                 supabase/
                     client.ts
+    src/
+        app/
+            success/
+                page.jsx
 
+================================================================================
+FILE: main.py
+================================================================================
 
-File: main.py
-=============
+"""
+Main application file for the Reverse Auction API.
+"""
+
 import os
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from supabase import create_client, Client
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional
+
 import uvicorn
 from dotenv import load_dotenv
-from typing import Dict, List
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from supabase import Client, create_client
 
-app = FastAPI()
+from database import create_db_and_tables
+from razorpay_router import router as razorpay_router
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
-    allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
-)
-
-# Initialize Supabase client
-from dotenv import load_dotenv
-
-# Ensure environment variables are loaded from the .env file in the current working directory
+# Ensure environment variables are loaded
 load_dotenv(".env")
+load_dotenv()
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://your-project.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "your-anon-key")
 
+supabase: Optional[Client] = None
+
 try:
     if SUPABASE_URL == "https://your-project.supabase.co":
         print("Warning: Using placeholder SUPABASE_URL")
-        
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-except Exception as e:
+
+    if SUPABASE_URL and SUPABASE_KEY:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:  # pylint: disable=broad-exception-caught
     print(f"Error initializing Supabase client: {e}")
-    supabase = None
-    
+
+
 class ConnectionManager:
-    def __init__(self):
-        # Store active connections per product: {product_id: [websocket1, websocket2, ...]}
+    """Manages active WebSocket connections for products."""
+
+    def __init__(self) -> None:
+        # Store active connections per product:
+        # {product_id: [websocket1, websocket2, ...]}
         self.active_connections: Dict[str, List[WebSocket]] = {}
 
-    async def connect(self, websocket: WebSocket, product_id: str):
+    async def connect(self, websocket: WebSocket, product_id: str) -> None:
+        """Accept and store a new WebSocket connection."""
         await websocket.accept()
         if product_id not in self.active_connections:
             self.active_connections[product_id] = []
         self.active_connections[product_id].append(websocket)
 
-    def disconnect(self, websocket: WebSocket, product_id: str):
+    def disconnect(self, websocket: WebSocket, product_id: str) -> None:
+        """Remove a disconnected WebSocket."""
         if product_id in self.active_connections:
             if websocket in self.active_connections[product_id]:
                 self.active_connections[product_id].remove(websocket)
             if not self.active_connections[product_id]:
-                del self.active_connections[product_id]
+                self.active_connections.pop(product_id, None)
 
-    async def broadcast(self, message: dict, product_id: str):
+    async def broadcast(self, message: Dict[str, Any], product_id: str) -> None:
+        """Send a JSON message to all connected clients for a product."""
         if product_id in self.active_connections:
             for connection in list(self.active_connections[product_id]):
                 try:
@@ -116,113 +142,197 @@ class ConnectionManager:
                 except RuntimeError:
                     pass
 
+
 manager = ConnectionManager()
 
+
+# Allowed origins
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+ALLOWED_ORIGINS = [
+    FRONTEND_URL,
+    "http://localhost:3000",   # Next.js dev server
+    "http://127.0.0.1:3000",
+    "https://*.vercel.app",    # Allows all Vercel subdomains
+    "*",                       # Temporarily allow all for local testing
+]
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create DB tables on startup."""
+    create_db_and_tables()
+    yield
+
+app = FastAPI(title="Reverse Auction API", version="1.0.0", lifespan=lifespan)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,  # Allows specified origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+app.include_router(razorpay_router)
+
+
 @app.get("/")
-def read_root():
-    return {"message": "Welcome to the Reverse Auction API"}
+def read_root() -> Dict[str, str]:
+    """Root endpoint."""
+    return {"status": "ok", "message": "Welcome to the Reverse Auction API"}
+
 
 @app.get("/products")
-def get_products():
+def get_products() -> Dict[str, Any]:
+    """Retrieve all products from Supabase."""
     if not supabase:
         return {"error": "Supabase client not initialized properly."}
-    
+
+    assert supabase is not None
     # Example of querying the Products table
     response = supabase.table("products").select("*").execute()
     return {"data": response.data}
-    
+
+
 @app.websocket("/ws/auction/{product_id}")
-async def websocket_auction_endpoint(websocket: WebSocket, product_id: str):
+async def websocket_auction_endpoint(
+    websocket: WebSocket, product_id: str
+) -> None:
+    """WebSocket endpoint for live auction updates and bidding."""
     await manager.connect(websocket, product_id)
+    if not supabase:
+        await websocket.send_json(
+            {"error": "Supabase client not initialized properly."}
+        )
+        manager.disconnect(websocket, product_id)
+        return
+
+    assert supabase is not None
+
     try:
         while True:
             data = await websocket.receive_json()
             if data.get("action") == "share_click":
-                # 1. Query current state of the product
-                response = supabase.table("products").select("current_price, minimum_price, drop_time").eq("id", product_id).execute()
-                
-                if not response.data:
+                user_id = data.get("user_id")
+
+                if not user_id:
+                    await websocket.send_json({"error": "User ID is required to share"})
+                    continue
+
+                # 1. Try to record the share
+                try:
+                    share_response = (
+                        supabase.table("user_shares")
+                        .insert({"user_id": user_id, "product_id": product_id})
+                        .execute()
+                    )
+                except Exception as e:
+                    # Supabase python client raises an exception on constraint failure
+                    err_message = str(e)
+                    if "duplicate key value violates unique constraint" in err_message.lower():
+                        await websocket.send_json({"error": "You have already shared this drop!"})
+                    else:
+                        await websocket.send_json({"error": "Could not record share"})
+                    continue
+
+                if getattr(share_response, 'error', None) and share_response.error:
+                     # For some client versions, errors are returned instead of raised
+                     if share_response.error.code == "23505": # PostgreSQL unique violation code
+                         await websocket.send_json({"error": "You have already shared this drop!"})
+                     else:
+                        await websocket.send_json({"error": "Could not record share"})
+                     continue
+
+                # 2. Query current state of the product
+                response = (
+                    supabase.table("products")
+                    .select("current_price, minimum_price, drop_time")
+                    .eq("id", product_id)
+                    .execute()
+                )
+
+                if not response.data or len(response.data) == 0:
                     await websocket.send_json({"error": "Product not found"})
                     continue
-                    
+
                 product = response.data[0]
-                current_price = float(product["current_price"])
-                minimum_price = float(product["minimum_price"])
-                
+                if not isinstance(product, dict):
+                    continue
+
+                current_price = float(product.get("current_price", 0))
+                minimum_price = float(product.get("minimum_price", 0))
+
                 # Check drop_time
                 drop_time_str = product.get("drop_time")
-                if drop_time_str:
-                    from datetime import datetime, timezone
+                if isinstance(drop_time_str, str):
                     # Handle Supabase Z notation for UTC
-                    drop_time_parsed = datetime.fromisoformat(drop_time_str.replace("Z", "+00:00"))
-                    if datetime.now(timezone.utc) < drop_time_parsed:
-                        await websocket.send_json({"error": "Drop has not started yet"})
+                    drop_time_parsed = datetime.fromisoformat(
+                        drop_time_str.replace("Z", "+00:00")
+                    )
+                    now_utc = datetime.now(timezone.utc)
+                    if now_utc < drop_time_parsed:
+                        err = {"error": "Drop has not started yet"}
+                        await websocket.send_json(err)
+                        
+                        # Rollback share if drop hasn't started?
+                        # Probably better to just keep it recorded or prevent click UI wise
                         continue
-                
-                # 2. Deduct price if it hasn't reached minimum
+                        
+                    if now_utc > drop_time_parsed + timedelta(hours=24):
+                        err = {"error": "The drop has ended! Processing winners..."}
+                        await websocket.send_json(err)
+                        continue
+
+                # 3. Deduct price if it hasn't reached minimum
                 if current_price > minimum_price:
-                    new_price = max(current_price - 1.0, minimum_price) # Ensure we don't drop below minimum
-                    
-                    # 3. Update the new price in database
-                    update_response = supabase.table("products").update({"current_price": new_price}).eq("id", product_id).execute()
-                    
-                    if update_response.data:
-                        # 4. Broadcast the new price to all clients viewing this product
+                    # Ensure we don't drop below minimum
+                    new_price = max(current_price - 1.0, minimum_price)
+
+                    # 4. Update the new price in database
+                    update_response = (
+                        supabase.table("products")
+                        .update({"current_price": new_price})
+                        .eq("id", product_id)
+                        .execute()
+                    )
+
+                    if update_response.data and len(update_response.data) > 0:
+                        # 5. Broadcast the new price
                         updated_product = update_response.data[0]
-                        await manager.broadcast({
-                            "type": "price_update",
-                            "product_id": product_id,
-                            "new_price": float(updated_product["current_price"])
-                        }, product_id)
+                        if isinstance(updated_product, dict):
+                            new_val = float(
+                                updated_product.get("current_price", 0)
+                            )
+                            await manager.broadcast(
+                                {
+                                    "type": "price_update",
+                                    "product_id": product_id,
+                                    "new_price": new_val,
+                                },
+                                product_id,
+                            )
                     else:
-                        await websocket.send_json({"error": "Failed to update price"})
+                        await websocket.send_json(
+                            {"error": "Failed to update price"}
+                        )
                 else:
-                    await websocket.send_json({"message": "Price has reached the minimum limit."})
-                    
+                    msg = {"message": "Price has reached the minimum limit."}
+                    await websocket.send_json(msg)
+
     except WebSocketDisconnect:
         manager.disconnect(websocket, product_id)
-    except Exception as e:
+    except Exception as e:  # pylint: disable=broad-exception-caught
         print(f"WebSocket Error: {e}")
         manager.disconnect(websocket, product_id)
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
+================================================================================
+FILE: frontend/src/components/AuctionCard.tsx
+================================================================================
 
-File: frontend/src/app/page.tsx
-===============================
-import Header from '@/components/Header';
-import Hero from '@/components/Hero';
-import AuctionCard from '@/components/AuctionCard';
-import FigmaUIOverlay from '@/components/FigmaUIOverlay';
-
-export default function Home() {
-  return (
-    <div className="min-h-screen flex flex-col bg-gray-50 font-[family-name:var(--font-geist-sans)] relative">
-      <FigmaUIOverlay />
-
-      <div className="relative z-10 flex flex-col min-h-screen">
-        <Header />
-
-        <main className="flex-1 w-full pb-20">
-          <Hero />
-
-          <section className="container max-w-screen-xl mx-auto px-4 -mt-10 sm:-mt-20 relative z-20">
-            <AuctionCard />
-          </section>
-        </main>
-
-        <footer className="w-full border-t border-gray-200 bg-white py-8 text-center text-sm text-gray-500">
-          <p>© {new Date().getFullYear()} Drop Street. All rights reserved.</p>
-        </footer>
-      </div>
-    </div>
-  );
-}
-
-
-File: frontend/src/components/AuctionCard.tsx
-=============================================
 'use client';
 
 import React, { useEffect, useState, useRef } from 'react';
@@ -240,6 +350,8 @@ const AuctionCard = () => {
     const [dropTime, setDropTime] = useState<Date | null>(null);
     const [brandUrl, setBrandUrl] = useState<string | null>(null);
     const [timeRemaining, setTimeRemaining] = useState<number>(0); // Time in milliseconds
+    const [isEnded, setIsEnded] = useState<boolean>(false);
+    const [errorMsg, setErrorMsg] = useState<string | null>(null); // State for WebSocket errors
 
     const wsRef = useRef<WebSocket | null>(null);
     const supabase = createClient();
@@ -272,6 +384,8 @@ const AuctionCard = () => {
 
     // WebSocket logic
     useEffect(() => {
+        if (isEnded) return; // Do not connect if ended
+
         const ws = new WebSocket(`ws://localhost:8000/ws/auction/${PRODUCT_ID}`);
         wsRef.current = ws;
 
@@ -281,8 +395,22 @@ const AuctionCard = () => {
 
         ws.onmessage = (event) => {
             const data = JSON.parse(event.data);
+
             if (data.type === 'price_update') {
                 setPrice(data.new_price);
+                setErrorMsg(null); // Clear errors on a successful price drop
+            } else if (data.error) {
+                // If the backend blocked the share (e.g. unique constraint), show the error.
+                setErrorMsg(data.error);
+
+                if (data.error.includes("The drop has ended")) {
+                    setIsEnded(true);
+                }
+
+                // Clear the error message automatically after 3 seconds
+                setTimeout(() => {
+                    setErrorMsg(null);
+                }, 3000);
             }
         };
 
@@ -300,7 +428,7 @@ const AuctionCard = () => {
                 wsRef.current.close();
             }
         };
-    }, []);
+    }, [isEnded]);
 
     // Countdown Timer logic
     useEffect(() => {
@@ -309,8 +437,26 @@ const AuctionCard = () => {
         const calculateTimeRemaining = () => {
             const now = new Date().getTime();
             const target = dropTime.getTime();
-            const difference = target - now;
-            setTimeRemaining(Math.max(0, difference));
+            const endTarget = target + (24 * 60 * 60 * 1000); // 24 hours later
+
+            if (now >= endTarget) {
+                // Drop has ended!
+                setIsEnded(true);
+                setTimeRemaining(0);
+                if (wsRef.current) {
+                    wsRef.current.close();
+                }
+            } else if (now >= target) {
+                // Drop is active. Count down to end target? Or just keep it 0 as user stated.
+                // We will count down to 0 for start as original logic, but here if user wanted 0 to mean end:
+                // "If timeRemaining === 0 (meaning the countdown has finished): Change the ... text to DROP ENDED"
+                // To adhere precisely, let's keep timeRemaining as time till start, but when it's over, `isEnded` is true
+                setTimeRemaining(0);
+            } else {
+                // Drop hasn't started yet
+                const difference = target - now;
+                setTimeRemaining(Math.max(0, difference));
+            }
         };
 
         // Calculate immediately 
@@ -336,8 +482,13 @@ const AuctionCard = () => {
 
     const handleShareClick = () => {
         // Double check not visually disabled and socket is alive
-        if (timeRemaining <= 0 && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify({ action: 'share_click' }));
+        if (!isLocked && !isEnded && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            // Include a dummy user ID to test the Supabase Unique constraints!
+            const currentUserId = '123e4567-e89b-12d3-a456-426614174000';
+            wsRef.current.send(JSON.stringify({
+                action: 'share_click',
+                user_id: currentUserId
+            }));
         }
     };
 
@@ -360,45 +511,71 @@ const AuctionCard = () => {
                     <div></div> // Empty div to keep flex space-between intact
                 )}
 
-                <div className={`flex items-center gap-2 text-xs font-semibold px-2 py-1 rounded-full ${status === 'connected' ? 'text-green-700 bg-green-100' : 'text-amber-700 bg-amber-100'}`}>
-                    <span className={`h-2 w-2 rounded-full ${status === 'connected' ? 'bg-green-500 animate-pulse' : 'bg-amber-500'}`}></span>
-                    {status === 'connected' ? 'Live' : 'Connecting...'}
+                <div className={`flex items-center gap-2 text-xs font-semibold px-2 py-1 rounded-full ${isEnded ? 'text-red-700 bg-red-100' : status === 'connected' ? 'text-green-700 bg-green-100' : 'text-amber-700 bg-amber-100'}`}>
+                    {!isEnded && <span className={`h-2 w-2 rounded-full ${status === 'connected' ? 'bg-green-500 animate-pulse' : 'bg-amber-500'}`}></span>}
+                    {isEnded ? 'Ended' : status === 'connected' ? 'Live' : 'Connecting...'}
                 </div>
             </div>
 
             {/* Hype Timer Display */}
-            {dropTime && (
+            {dropTime && !isEnded && (
                 <div className="mb-8 w-full">
-                    <h3 className="text-center text-xs font-bold tracking-widest text-red-500 uppercase mb-2">Drop Starts In</h3>
+                    <h3 className="text-center text-xs font-bold tracking-widest text-red-500 uppercase mb-2">
+                        {timeRemaining > 0 ? 'Drop Starts In' : 'Drop Status'}
+                    </h3>
                     <div className="text-center bg-gray-50 rounded-2xl py-4 border border-gray-100">
-                        <span className="text-5xl font-black tracking-tighter tabular-nums text-gray-900">
-                            {formatTime(timeRemaining)}
+                        {timeRemaining > 0 ? (
+                            <span className="text-5xl font-black tracking-tighter tabular-nums text-gray-900">
+                                {formatTime(timeRemaining)}
+                            </span>
+                        ) : (
+                            <span className="text-3xl font-black text-green-600 tracking-tight animate-pulse">
+                                LIVE NOW
+                            </span>
+                        )}
+                    </div>
+                </div>
+            )}
+
+            {isEnded && (
+                <div className="mb-8 w-full">
+                    <h3 className="text-center text-xs font-bold tracking-widest text-red-500 uppercase mb-2">Drop Status</h3>
+                    <div className="text-center bg-gray-50 rounded-2xl py-4 border border-gray-100">
+                        <span className="text-3xl font-black text-gray-900 tracking-tight">
+                            COMPLETED
                         </span>
                     </div>
                 </div>
             )}
 
-            <h2 className="text-sm font-bold tracking-widest text-gray-400 uppercase mb-2">Current Price</h2>
+            <h2 className="text-sm font-bold tracking-widest text-gray-400 uppercase mb-2">{isEnded ? 'Final Price' : 'Current Price'}</h2>
 
-            <div className={`text-6xl sm:text-7xl font-black tracking-tighter mb-8 tabular-nums transition-colors duration-500 ${isLocked ? 'text-gray-300' : 'text-gray-900'}`}>
+            <div className={`text-6xl sm:text-7xl font-black tracking-tighter mb-8 tabular-nums transition-colors duration-500 ${isLocked || isEnded ? 'text-gray-300' : 'text-gray-900'}`}>
                 {price !== null ? `₹${price.toFixed(2)}` : '...'}
             </div>
 
             <Button
                 onClick={handleShareClick}
-                disabled={isLocked || status !== 'connected'}
+                disabled={isLocked || isEnded || status !== 'connected'}
                 className="w-full h-16 text-lg sm:text-xl font-black relative overflow-hidden group/btn shadow-lg rounded-2xl transition-all"
             >
                 <div className="absolute inset-0 bg-gradient-to-r from-red-600 to-purple-600 opacity-0 transition-opacity duration-300 group-hover/btn:opacity-20 pointer-events-none"></div>
-                {isLocked ? 'LOCKED UNTIL DROP' : 'SHARE TO DROP PRICE (₹1)'}
+                {isEnded ? 'DROP ENDED' : isLocked ? 'LOCKED UNTIL DROP' : 'SHARE TO DROP PRICE (₹1)'}
             </Button>
 
+            {/* Error Message Box */}
+            {errorMsg && (
+                <div className="mt-3 text-red-500 text-sm font-bold text-center animate-pulse">
+                    ⚠️ {errorMsg}
+                </div>
+            )}
+
             <p className="text-xs text-gray-500 mt-4 text-center font-medium">
-                {isLocked ? 'Waiting for countdown to finish.' : 'Clicking reduces the price by ₹1 for EVERYONE.'}
+                {isEnded ? 'This drop has ended. No more drops available.' : isLocked ? 'Waiting for countdown to finish.' : 'Clicking reduces the price by ₹1 for EVERYONE.'}
             </p>
 
             <div className="w-full mt-6 pt-6 border-t border-gray-100">
-                <RazorpayCheckout currentPrice={price} />
+                <RazorpayCheckout currentPrice={price} disabled={isEnded || isLocked} />
             </div>
         </div>
     );
@@ -406,4 +583,80 @@ const AuctionCard = () => {
 
 export default AuctionCard;
 
+================================================================================
+FILE: frontend/src/components/RazorpayCheckout.tsx
+================================================================================
 
+'use client';
+
+import React, { useState } from 'react';
+
+// Extend window to support the Razorpay injected property
+declare global {
+    interface Window {
+        Razorpay: any;
+    }
+}
+
+interface RazorpayCheckoutProps {
+    currentPrice: number | null;
+    disabled?: boolean;
+}
+
+const RazorpayCheckout: React.FC<RazorpayCheckoutProps> = ({ currentPrice, disabled }) => {
+    const [loading, setLoading] = useState(false);
+    const [success, setSuccess] = useState(false);
+
+    const handlePayment = async () => {
+        if (!currentPrice) return;
+        setLoading(true);
+
+        try {
+            // 1. Hit the backend mock order creation endpoint
+            const orderRes = await fetch('http://localhost:8000/razorpay/create-order', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ amount: currentPrice, currency: 'INR' })
+            });
+
+            if (!orderRes.ok) throw new Error('Failed to create order');
+
+            // 2. Simulate the Razorpay popup delay (1.5 seconds)
+            await new Promise(resolve => setTimeout(resolve, 1500));
+
+            // 3. Mark as successful!
+            setSuccess(true);
+            alert(`Payment Authorized at ₹${currentPrice}! Your intent is locked.`);
+
+        } catch (error) {
+            console.error('Checkout error:', error);
+            alert('Error initiating checkout.');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    if (success) {
+        return (
+            <div className="w-full mt-4 py-6 px-6 rounded-xl font-black border-2 bg-green-50 text-green-700 border-green-200 text-center shadow-inner text-xl">
+                <span>🎉 INTENT LOCKED AT <span className="text-green-900 border-b-2 border-green-900">₹{currentPrice?.toFixed(2)}</span></span>
+            </div>
+        );
+    }
+
+    return (
+        <button
+            onClick={handlePayment}
+            disabled={!currentPrice || loading}
+            className={`w-full mt-4 py-4 px-6 rounded-xl font-bold border-2 flex justify-between items-center transition-all ${!currentPrice || loading
+                ? 'bg-gray-200 text-gray-500 cursor-not-allowed border-gray-300'
+                : 'bg-black text-white cursor-pointer hover:bg-gray-800 border-black shadow-xl ring-2 ring-black ring-offset-2'
+                }`}
+        >
+            <span>{loading ? 'Processing Server...' : 'Lock Intent Now'}</span>
+            <span>{currentPrice ? `₹${currentPrice.toFixed(2)}` : 'Wait...'}</span>
+        </button>
+    );
+};
+
+export default RazorpayCheckout;
